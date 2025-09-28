@@ -702,15 +702,10 @@ def align_chords_to_words(segments, lrc_lines):
 
 
 # === EDIT THESE PATHS ===
-SONIC = os.environ.get(
-    "SONIC",
-    r"C:\Users\ellis_59031kw\sonic-annotator\sonic-annotator-win64\sonic-annotator.exe"
-)
-VAMP_PATH = os.environ.get(
-    "VAMP_PATH",
-    r"C:\Users\ellis_59031kw\OneDrive\Desktop\vamp-plugins\Vamp Plugins;C:\ Program Files\Vamp Plugins"
-)
-DISABLE_SONIC = os.environ.get("DISABLE_SONIC", "1") == "1"
+SONIC = os.environ.get("SONIC", r"C:\...windows\path\sonic-annotator.exe")
+VAMP_PATH = os.environ.get("VAMP_PATH", r"...")
+DISABLE_SONIC = os.environ.get("DISABLE_SONIC", "0") == "1"
+
 
 # (You can also use: r"C:\Program Files\Vamp Plugins" if that’s where the DLL is)
 # ========================
