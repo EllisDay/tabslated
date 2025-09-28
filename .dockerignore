@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+
+# VCS / OS
+.git/
+.gitignore
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+.cache/
