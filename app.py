@@ -719,6 +719,141 @@ VERSION = "SquareOne v1"
 
 app = FastAPI(title=f"Chord Detector ({VERSION})")
 
+# add near your imports
+from google.cloud import storage
+from google.oauth2 import service_account
+import datetime, json
+
+GCS_BUCKET = os.environ.get("GCS_BUCKET")  # set in Cloud Run
+SIGN_URL_EXPIRE_MIN = 15
+
+def _storage_client():
+    # uses default creds in Cloud Run
+    return storage.Client()
+
+@app.post("/upload-url")
+def get_upload_url():
+    """
+    Returns a resumable signed URL for uploading a WAV directly to GCS.
+    Client does a PUT to this URL (or uses x-goog-resumable).
+    """
+    fn = f"uploads/{datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}.wav"
+    bucket = _storage_client().bucket(GCS_BUCKET)
+    blob = bucket.blob(fn)
+
+    url = blob.generate_signed_url(
+        version="v4",
+        expiration=datetime.timedelta(minutes=SIGN_URL_EXPIRE_MIN),
+        method="PUT",
+        content_type="audio/wav",
+        headers={"x-goog-resumable": "start"},
+    )
+    return {"ok": True, "bucket": GCS_BUCKET, "object": fn, "upload_url": url}
+
+
+import tempfile
+
+def _download_gcs_to_temp(bucket_name: str, object_name: str) -> str:
+    client = _storage_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(object_name)
+    fd, path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
+    blob.download_to_filename(path)
+    return path
+
+from fastapi import Body
+
+@app.post("/analyze_gcs")
+def analyze_gcs(
+    ref: dict = Body(...),  # { "bucket": "...", "object": "...", "lyrics_lrc": "...", "lyrics_auto": "true/false" }
+):
+    wav = None
+    try:
+        bucket = ref.get("bucket") or GCS_BUCKET
+        obj = ref["object"]
+        lyrics_lrc = (ref.get("lyrics_lrc") or "").strip()
+        lyrics_auto = str(ref.get("lyrics_auto") or "").lower() == "true"
+
+        wav = _download_gcs_to_temp(bucket, obj)
+
+        # ---- chord detection (do NOT fail if Sonic missing) ----
+        segments_error = None
+        final, pattern, sections = [], [], []
+        try:
+            lab = run_sonic_simplechord(wav)  # works if Sonic in Docker image
+            raw_segments = parse_lab(lab)
+            final, pattern, sections = postprocess_variable_pattern(raw_segments)
+        except Exception as e:
+            segments_error = f"Chord detection unavailable: {type(e).__name__}: {e}"
+
+        # ---- key detection ----
+        det_key = None
+        if final:
+            try:
+                tonic_pc, mode = estimate_key_krumhansl(wav)
+                if tonic_pc is not None:
+                    det_key = f"{PC_NAMES[tonic_pc]} {'major' if mode == 'maj' else 'minor'}"
+                    final = key_aware_correct(final, tonic_pc, mode,
+                                              drop_out_of_scale_if_short=True, short_thresh=1.2)
+            except Exception:
+                pass
+
+        # ---- lyrics (ASR only if requested and empty) ----
+        lrc_text = lyrics_lrc
+        asr_error = None
+        if not lrc_text and lyrics_auto:
+            try:
+                lrc_text = whisper_to_lrc(wav, per_word=False)
+            except Exception as e:
+                asr_error = f"Auto-lyrics failed: {type(e).__name__}: {e}"
+                lrc_text = ""
+
+        aligned = []
+        if lrc_text:
+            lines = parse_lrc(lrc_text)
+            if not any(ln.get("start") is not None for ln in lines):
+                total = float(final[-1]["end"]) if final else 0.0
+                if total <= 0 and librosa is not None:
+                    try:
+                        y, sr = librosa.load(wav, sr=None, mono=True)
+                        total = len(y) / float(sr)
+                    except Exception:
+                        total = 0.0
+                n = max(1, len(lines))
+                step = (total or n) / n
+                for i, ln in enumerate(lines):
+                    ln["start"] = i*step
+                    ln["end"] = (i+1)*step if i < n-1 else total
+
+            song_end = float(final[-1]["end"]) if final else (lines[-1]["end"] if lines and lines[-1].get("end") else None)
+            for i, ln in enumerate(lines):
+                if ln.get("start") is not None and ln.get("end") is None:
+                    ln["end"] = lines[i+1]["start"] if i+1 < len(lines) and lines[i+1].get("start") is not None else song_end
+
+            aligned = align_chords_to_words(final, lines)
+
+        return JSONResponse({
+            "ok": True,
+            "gcs_object": obj,
+            "detected_key": det_key,
+            "detected_pattern": pattern,
+            "sections": sections,
+            "segments": final,
+            "segments_error": segments_error,
+            "lyrics_lrc": lrc_text or None,
+            "aligned": aligned,
+            "asr_error": asr_error,
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    finally:
+        try:
+            if wav and os.path.exists(wav):
+                os.remove(wav)
+        except Exception:
+            pass
+
+
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -901,54 +1036,54 @@ def home():
 <script>
 const f = document.getElementById('f');
 const tab = document.getElementById('tab');
-const lrc = document.getElementById('lrc');
 const auto = document.getElementById('auto');
-const smk = document.getElementById('smk');
+const lrc = document.getElementById('lrc');
 
 f.addEventListener('submit', async (e)=>{
   e.preventDefault();
-  tab.textContent = 'Working…';
+  tab.textContent = 'Uploading…';
 
-  const fd = new FormData(f);
-  fd.append('lyrics_auto', auto.checked ? 'true' : 'false');
+  const file = f.file.files[0];
+  if (!file) { tab.textContent = 'Choose a WAV first.'; return; }
 
-  try {
-    const r = await fetch('/analyze', { method:'POST', body: fd });
-    if (!r.ok) {
-      tab.textContent = `Error running /analyze\nHTTP ${r.status} ${r.statusText}\n${await r.text()}`;
-      return;
-    }
-    const j = await r.json();
+  // 1) Get upload URL
+  const r1 = await fetch('/upload-url', {method:'POST'});
+  const j1 = await r1.json();
+  if (!j1.ok) { tab.textContent = 'Failed to get upload URL'; return; }
 
-    if (j.aligned && j.aligned.length) {
-      tab.textContent = j.aligned.map(x => x.mono).join("\\n\\n");
-    } else if (j.lyrics_lrc) {
-      tab.textContent = "No per-line alignment built, but LRC was returned:\\n\\n" + j.lyrics_lrc;
-    } else {
-      tab.textContent = "No lyrics provided/available. Paste LRC or enable auto-generate.";
-    }
-  } catch (err) {
-    tab.textContent = 'Network/JS error calling /analyze';
+  // 2) Upload directly to GCS (resumable)
+  const put = await fetch(j1.upload_url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'audio/wav', 'x-goog-resumable': 'start' },
+    body: file
+  });
+  if (!put.ok) {
+    tab.textContent = 'Upload failed: ' + put.status + ' ' + put.statusText;
+    return;
   }
-});
 
-smk.addEventListener('click', async ()=>{
-  tab.textContent='Running smoketest…';
-  try {
-    const r = await fetch('/_smoketest');
-    if (!r.ok) {
-      tab.textContent = 'Smoketest error.';
-      return;
-    }
-    const j = await r.json();
-    if (j.segments && j.segments.length) {
-      tab.textContent = j.segments.map(s => `${s.start.toFixed(2)}–${s.end.toFixed(2)}\\t${s.chord}`).join("\\n");
-    } else {
-      tab.textContent = 'Smoketest returned no segments.';
-    }
-  } catch (e) {
-    tab.textContent = 'Smoketest error.';
+  tab.textContent = 'Analyzing…';
+
+  // 3) Tell backend to analyze the uploaded object
+  const r2 = await fetch('/analyze_gcs', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({
+      bucket: j1.bucket,
+      object: j1.object,
+      lyrics_auto: auto.checked ? 'true' : 'false',
+      lyrics_lrc: lrc.value || ''
+    })
+  });
+  const j2 = await r2.json();
+  if (!r2.ok || !j2.ok) {
+    tab.textContent = (j2 && j2.error) ? j2.error : ('Analyze error ' + r2.status);
+    return;
   }
+
+  if (j2.aligned?.length) tab.textContent = j2.aligned.map(x => x.mono).join("\n\n");
+  else if (j2.lyrics_lrc) tab.textContent = "Lyrics:\n\n" + j2.lyrics_lrc;
+  else tab.textContent = "No lyrics provided/available.";
 });
 </script>
 </body>
