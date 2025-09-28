@@ -4,5 +4,6 @@ python-multipart
 numpy==1.26.*
 scipy==1.11.*
 librosa==0.10.1
+soundfile
 faster-whisper
 google-cloud-storage
