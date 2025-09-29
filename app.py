@@ -849,21 +849,19 @@ def analyze_gcs(
             pass
 
 
-
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://tabslated.web.app",   # your Firebase Hosting site
-        "https://api.tabslated.com",   # your new API domain
-        "http://localhost:3000",       # optional local dev
+        "https://tabslated.web.app",   # Firebase site
+        "http://localhost:8000",       # local dev (if any)
+        "http://localhost:5173"
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ----- Core helpers -----
 import tempfile
@@ -1002,10 +1000,10 @@ def home():
     html = """
 <!doctype html>
 <meta charset="utf-8"/>
-<title>🎸 Tabslated - Guitar Tab Generator 1 🎸</title>
+<title>🎸 Tabslated - Guitar Tab Generator 🎸</title>
 <body style="font-family:system-ui;background:#0b0f19;color:#e8eef8">
   <div style="max-width:900px;margin:2rem auto">
-    <h1>🎸 Tabslated - Guitar Tab Generator 1 🎸</h1>
+    <h1>🎸 Tabslated - Guitar Tab Generator 🎸</h1>
     <p style="opacity:.8">Upload a <strong>WAV</strong>. (Optional) paste <strong>LRC</strong> or plain lyrics. If you leave it empty and check “Auto-generate,” the server will transcribe vocals with Whisper.</p>
 
     <form id="f" enctype="multipart/form-data" style="display:grid;gap:0.75rem">
@@ -1029,56 +1027,59 @@ def home():
   </div>
 
 <script>
-const f = document.getElementById('f');
+/* ==== IMPORTANT: Point to your Cloud Run API ==== */
+const API = "https://YOUR-CLOUD-RUN-URL";  // e.g. "https://tabslated-836301510193.us-central1.run.app"
+
+const f   = document.getElementById('f');
 const tab = document.getElementById('tab');
-const auto = document.getElementById('auto');
 const lrc = document.getElementById('lrc');
+const auto= document.getElementById('auto');
+const smk = document.getElementById('smk');
 
 f.addEventListener('submit', async (e)=>{
   e.preventDefault();
-  tab.textContent = 'Uploading…';
+  tab.textContent = 'Working…';
 
-  const file = f.file.files[0];
-  if (!file) { tab.textContent = 'Choose a WAV first.'; return; }
+  const fd = new FormData(f);
+  fd.append('lyrics_auto', auto.checked ? 'true' : 'false');
 
-  // 1) Get upload URL
-  const r1 = await fetch('/upload-url', {method:'POST'});
-  const j1 = await r1.json();
-  if (!j1.ok) { tab.textContent = 'Failed to get upload URL'; return; }
-
-  // 2) Upload directly to GCS (resumable)
-  const put = await fetch(j1.upload_url, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'audio/wav', 'x-goog-resumable': 'start' },
-    body: file
-  });
-  if (!put.ok) {
-    tab.textContent = 'Upload failed: ' + put.status + ' ' + put.statusText;
-    return;
+  try {
+    const r = await fetch(`${API}/analyze`, { method:'POST', body: fd });
+    if (!r.ok) {
+      tab.textContent = `Error running /analyze\\nHTTP ${r.status} ${r.statusText}\\n${await r.text()}`;
+      return;
+    }
+    const j = await r.json();
+    tab.textContent = '';
+    if (j.segments_error) tab.textContent += `Note: ${j.segments_error}\\n\\n`;
+    if (j.asr_error)      tab.textContent += `Note: ${j.asr_error}\\n\\n`;
+    if (j.aligned?.length) tab.textContent += j.aligned.map(x => x.mono).join("\\n\\n");
+    else if (j.lyrics_lrc) tab.textContent += "LRC:\\n\\n" + j.lyrics_lrc;
+    else tab.textContent += "No lyrics provided/available.";
+  } catch (err) {
+    tab.textContent = 'Network/JS error calling /analyze';
   }
+});
 
-  tab.textContent = 'Analyzing…';
-
-  // 3) Tell backend to analyze the uploaded object
-  const r2 = await fetch('/analyze_gcs', {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      bucket: j1.bucket,
-      object: j1.object,
-      lyrics_auto: auto.checked ? 'true' : 'false',
-      lyrics_lrc: lrc.value || ''
-    })
-  });
-  const j2 = await r2.json();
-  if (!r2.ok || !j2.ok) {
-    tab.textContent = (j2 && j2.error) ? j2.error : ('Analyze error ' + r2.status);
-    return;
+smk.addEventListener('click', async ()=>{
+  tab.textContent='Running smoketest…';
+  try {
+    const r = await fetch(`${API}/_smoketest`);
+    if (!r.ok) {
+      tab.textContent = `Smoketest error (HTTP ${r.status}).`;
+      return;
+    }
+    const j = await r.json();
+    if (j.segments && j.segments.length) {
+      tab.textContent = j.segments.map(s => `${s.start.toFixed(2)}–${s.end.toFixed(2)}\\t${s.chord}`).join("\\n");
+    } else if (j.note) {
+      tab.textContent = j.note;
+    } else {
+      tab.textContent = 'Smoketest returned no segments.';
+    }
+  } catch (e) {
+    tab.textContent = 'Smoketest error.';
   }
-
-  if (j2.aligned?.length) tab.textContent = j2.aligned.map(x => x.mono).join("\n\n");
-  else if (j2.lyrics_lrc) tab.textContent = "Lyrics:\n\n" + j2.lyrics_lrc;
-  else tab.textContent = "No lyrics provided/available.";
 });
 </script>
 </body>
@@ -1098,14 +1099,24 @@ def whoami():
 
 @app.get("/health")
 def health():
-    # Try listing transforms; if it fails, we still return something helpful.
-    env = os.environ.copy(); env["VAMP_PATH"] = VAMP_PATH
+    env = os.environ.copy()
+    env["VAMP_PATH"] = VAMP_PATH
     try:
-        out = subprocess.check_output([SONIC, "-l"], env=env, stderr=subprocess.STDOUT, text=True, errors="ignore")
+        out = subprocess.check_output(
+            [SONIC, "-l"],
+            env=env,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="ignore"
+        )
         has_chordino = any("chordino" in ln.lower() for ln in out.splitlines())
-        return {"ok": True, "has_chordino": bool(has_chordino), "note": "look for 'chordino' in plugins list"}
+        return {"ok": True, "has_chordino": bool(has_chordino), "listing": out}
+    except subprocess.CalledProcessError as e:
+        # Return the combined stdout/stderr so we can see *why*
+        return {"ok": False, "error": str(e), "output": e.output}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
 
 @app.get("/_smoketest")
 def smoketest():
