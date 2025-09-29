@@ -1,7 +1,7 @@
 # ---------- Base ----------
 FROM ubuntu:22.04
 
-ARG CACHE_BUSTER=3
+ARG CACHE_BUSTER=4
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -13,33 +13,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libfftw3-single3 libsamplerate0 libmad0 \
     && rm -rf /var/lib/apt/lists/*
 
-# ---------- Sonic Annotator (vendor either .tar.gz or .AppImage) ----------
+# ---------- Sonic Annotator (tar.gz or AppImage → always ends as real ELF) ----------
 WORKDIR /tmp/sonic
-# Copy whatever you committed (pattern must match at least one file)
+# Copy whatever you committed (tar.gz, AppImage, or plain binary)
 COPY third_party/sonic-annotator* /tmp/sonic/
 
 RUN set -eux; \
-    if ls /tmp/sonic/sonic-annotator-*.tar.gz 1>/dev/null 2>&1; then \
-        tar -xzf /tmp/sonic/sonic-annotator-*.tar.gz -C /tmp/sonic; \
-        cp -v /tmp/sonic/sonic-annotator-*/sonic-annotator /usr/local/bin/sonic-annotator; \
-        chmod +x /usr/local/bin/sonic-annotator; \
-    elif ls /tmp/sonic/*.AppImage 1>/dev/null 2>&1 || [ -f /tmp/sonic/sonic-annotator ]; then \
-        appimg="$(ls /tmp/sonic/*.AppImage 2>/dev/null | head -n1 || true)"; \
-        [ -z "$appimg" ] && appimg="/tmp/sonic/sonic-annotator"; \
-        chmod +x "$appimg"; \
-        "$appimg" --appimage-extract; \
-        if [ -f squashfs-root/usr/bin/sonic-annotator ]; then \
-            cp -v squashfs-root/usr/bin/sonic-annotator /usr/local/bin/sonic-annotator; \
-        else \
-            cp -v squashfs-root/AppRun /usr/local/bin/sonic-annotator; \
-        fi; \
-        chmod +x /usr/local/bin/sonic-annotator; \
-        mkdir -p /usr/local/lib; \
-        cp -rv squashfs-root/usr/lib/* /usr/local/lib/ 2>/dev/null || true; \
-    else \
-        echo "No usable Sonic Annotator archive/AppImage found under /tmp/sonic" >&2; exit 1; \
+    # 1) Expand any tarballs we copied
+    for f in /tmp/sonic/*.tar.gz 2>/dev/null; do \
+      [ -f "$f" ] && tar -xzf "$f" -C /tmp/sonic || true; \
+    done; \
+    # 2) Pick a candidate file named sonic-annotator* (first match)
+    cand="$(find /tmp/sonic -maxdepth 3 -type f -name 'sonic-annotator*' | head -n1 || true)"; \
+    if [ -z "$cand" ]; then echo "No sonic-annotator artifact found" >&2; exit 1; fi; \
+    cp -v "$cand" /usr/local/bin/sonic-annotator; chmod +x /usr/local/bin/sonic-annotator; \
+    # 3) Try to extract if it's an AppImage; if extraction works, replace with the inner ELF
+    mkdir -p /tmp/sonic/extract; cd /tmp/sonic/extract; \
+    if /usr/local/bin/sonic-annotator --appimage-extract >/dev/null 2>&1; then \
+      if [ -f squashfs-root/usr/bin/sonic-annotator ]; then \
+        cp -v squashfs-root/usr/bin/sonic-annotator /usr/local/bin/sonic-annotator; \
+      else \
+        cp -v squashfs-root/AppRun /usr/local/bin/sonic-annotator; \
+      fi; \
+      chmod +x /usr/local/bin/sonic-annotator; \
     fi; \
-    rm -rf /tmp/sonic
+    cd /; rm -rf /tmp/sonic
+
+# Optional libs Sonic may want (harmless if not needed)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libfftw3-single3 libsamplerate0 libmad0 \
+    && rm -rf /var/lib/apt/lists/*
+
 
 # ---------- Vamp plugins ----------
 WORKDIR /tmp/vamp
