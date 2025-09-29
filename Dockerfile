@@ -1,7 +1,7 @@
 # ---------- Base ----------
 FROM ubuntu:22.04
 
-ARG CACHE_BUSTER=4
+ARG CACHE_BUSTER=5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -19,15 +19,20 @@ WORKDIR /tmp/sonic
 COPY third_party/sonic-annotator* /tmp/sonic/
 
 RUN set -eux; \
-    # 1) Expand any tarballs we copied
-    for f in /tmp/sonic/*.tar.gz 2>/dev/null; do \
-      [ -f "$f" ] && tar -xzf "$f" -C /tmp/sonic || true; \
+    # 1) Expand any tarballs we copied (guard if none exist)
+    for f in /tmp/sonic/*.tar.gz; do \
+      if [ -f "$f" ]; then \
+        tar -xzf "$f" -C /tmp/sonic; \
+      fi; \
     done; \
     # 2) Pick a candidate file named sonic-annotator* (first match)
-    cand="$(find /tmp/sonic -maxdepth 3 -type f -name 'sonic-annotator*' | head -n1 || true)"; \
+    cand=""; \
+    for p in /tmp/sonic/sonic-annotator* /tmp/sonic/*/sonic-annotator*; do \
+      if [ -f "$p" ]; then cand="$p"; break; fi; \
+    done; \
     if [ -z "$cand" ]; then echo "No sonic-annotator artifact found" >&2; exit 1; fi; \
     cp -v "$cand" /usr/local/bin/sonic-annotator; chmod +x /usr/local/bin/sonic-annotator; \
-    # 3) Try to extract if it's an AppImage; if extraction works, replace with the inner ELF
+    # 3) Try to extract if it's an AppImage; if extraction works, replace with inner ELF
     mkdir -p /tmp/sonic/extract; cd /tmp/sonic/extract; \
     if /usr/local/bin/sonic-annotator --appimage-extract >/dev/null 2>&1; then \
       if [ -f squashfs-root/usr/bin/sonic-annotator ]; then \
@@ -36,8 +41,15 @@ RUN set -eux; \
         cp -v squashfs-root/AppRun /usr/local/bin/sonic-annotator; \
       fi; \
       chmod +x /usr/local/bin/sonic-annotator; \
+      # Optionally copy bundled libs (best-effort)
+      mkdir -p /usr/local/lib; \
+      cp -rv squashfs-root/usr/lib/* /usr/local/lib/ 2>/dev/null || true; \
     fi; \
     cd /; rm -rf /tmp/sonic
+
+# Helpful during build; won't fail if it prints warnings
+RUN file /usr/local/bin/sonic-annotator || true
+RUN /usr/local/bin/sonic-annotator -l || true
 
 # Optional libs Sonic may want (harmless if not needed)
 RUN apt-get update && apt-get install -y --no-install-recommends \
