@@ -1,7 +1,7 @@
 # ---------- Base ----------
 FROM ubuntu:22.04
 
-ARG CACHE_BUSTER=5
+ARG CACHE_BUSTER=7
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -10,7 +10,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip python3-venv \
       libsndfile1 ffmpeg ca-certificates tar xz-utils \
-      libfftw3-single3 libsamplerate0 libmad0 \
+      libfftw3-single3 libsamplerate0 libmad0 file \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------- Sonic Annotator (tar.gz or AppImage → always ends as real ELF) ----------

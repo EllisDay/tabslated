@@ -74,7 +74,7 @@ __pycache__/
 *.pyc
 
 # Virtual environments
-.venv/
+.venv2/
 .env/
 
 # Audio/media files

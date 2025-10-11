@@ -1,26 +1,28 @@
-# app.py — minimal, from-scratch, chord detection via Sonic Annotator + Chordino
-import os, io, subprocess, tempfile, pathlib
+import environ
+env = environ.Env()
+environ.Env.read_env('.env')
+
+SONIC = env("SONIC")
+VAMP_PATH = env("VAMP_PATH")
+
+# app.py — local build that worked before deployment
+import os, subprocess, tempfile, pathlib
 import numpy as np
-#import soundfile as sf
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import soundfile as sf
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import HTMLResponse, JSONResponse
-
-
-# ====== Robust chord post-processing & pattern smoothing ======
-import re, numpy as np
-from collections import Counter, defaultdict
 
 # ====== Whisper (self-hosted, free) ======
 from faster_whisper import WhisperModel
 
-# Choose model via env var WHISPER_MODEL, fallback to something that runs on CPU.
-# Options in increasing accuracy/size: tiny, base, small, medium, large-v3
 WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small")
-# int8 is fast on CPU; use "float16"/"float32" if you have a GPU and want max accuracy.
+
+# Lazy-load so the app can start even if the model fails; force CPU to avoid CUDA/cuDNN.
 WHISPER = None
 def get_whisper():
     global WHISPER
     if WHISPER is None:
+        # int8 is fast on CPU; you can try "medium" later if your machine is beefy
         WHISPER = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
     return WHISPER
 
@@ -59,9 +61,11 @@ def whisper_to_lrc(audio_path: str, per_word=False) -> str:
                 lines.append(f"{_lrc_ts(seg.start)} {txt}")
         return "\n".join(lines)
 
+# ====== Robust chord post-processing & pattern smoothing ======
+import re
+from collections import Counter, defaultdict
 
 # ---------- Key detection + diatonic correction ----------
-import re
 try:
     import librosa
 except Exception:
@@ -89,10 +93,7 @@ _KR_MIN = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17]
 _KR_MAJ /= np.linalg.norm(_KR_MAJ); _KR_MIN /= np.linalg.norm(_KR_MIN)
 
 def estimate_key_krumhansl(wav_path: str, sr=22050):
-    """
-    Estimate global key by correlating mean chroma with Krumhansl profiles.
-    Returns (tonic_pc[0..11], mode_str 'maj'|'min')
-    """
+    """Estimate global key by correlating mean chroma with Krumhansl profiles."""
     if librosa is None:
         return None, None
     y, sr = librosa.load(wav_path, sr=sr, mono=True)
@@ -114,7 +115,7 @@ def diatonic_quality_for(root_pc: int, tonic_pc: int, mode: str):
     if mode == 'maj':
         mapping = {0:'maj', 2:'min', 4:'min', 5:'maj', 7:'maj', 9:'min', 11:'dim'}
         return mapping.get(deg)
-    else:  # natural minor; close enough for quality correction
+    else:  # natural minor
         mapping = {0:'min', 2:'dim', 3:'maj', 5:'min', 7:'min', 8:'maj', 10:'maj'}
         return mapping.get(deg)
 
@@ -123,10 +124,7 @@ _CHORD_RE = re.compile(r'^([A-G][b#]?)(m|dim|aug)?$')
 def key_aware_correct(segments, tonic_pc, mode,
                       drop_out_of_scale_if_short=True,
                       short_thresh=1.2):
-    """
-    Snap each chord's quality to the diatonic quality for the detected key.
-    Optionally drop out-of-scale short anomalies.
-    """
+    """Snap each chord's quality to the diatonic quality for the detected key."""
     if tonic_pc is None or mode not in ('maj','min'):
         return segments
     out = []
@@ -137,171 +135,69 @@ def key_aware_correct(segments, tonic_pc, mode,
         m = _CHORD_RE.match(name)
         if not m:
             out.append(s); continue
-        root, qual = m.group(1), (m.group(2) or '')
+        root, _qual = m.group(1), (m.group(2) or '')
         root_pc = NOTE_TO_PC.get(root)
         if root_pc is None:
             out.append(s); continue
         target = diatonic_quality_for(root_pc, tonic_pc, mode)
         if target:
-            # force diatonic quality
             new = root + ('m' if target=='min' else ('dim' if target=='dim' else ''))
             out.append({**s, "chord": new})
         else:
-            # root not in scale
             if drop_out_of_scale_if_short and (s["end"]-s["start"]) < short_thresh:
                 out.append({**s, "chord": "N.C."})
             else:
                 out.append(s)
     return _merge_adjacent(out)
 
-
-# ---- Simple chord fallback using librosa chroma (no Sonic needed) ----
-def fallback_chords_librosa(wav_path: str,
-                            sr=22050,
-                            hop_s=0.50,
-                            energy_thresh_db=-60.0):
-    """
-    Very simple chord estimator:
-      - chroma_CENS
-      - correlate vs 12 major / 12 minor triad templates
-      - choose best each hop_s seconds
-      - suppress very low-energy frames to N.C.
-      - return merged segments [{start,end,chord}]
-    """
-    if librosa is None:
-        return []
-
-    # Load mono
-    y, sr = librosa.load(wav_path, sr=sr, mono=True)
-    hop_length = max(1, int(sr * hop_s))
-
-    # Chroma (12, T)
-    C = librosa.feature.chroma_cens(y=y, sr=sr, hop_length=hop_length)
-    T = C.shape[1]
-    if T == 0:
-        return []
-
-    # Frame times
-    times = librosa.frames_to_time(np.arange(T), sr=sr, hop_length=hop_length)
-
-    # Rough loudness per frame (to mask silence)
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop_length, center=True).flatten()
-    rms_db = librosa.amplitude_to_db(np.maximum(1e-10, rms), ref=1.0)
-
-    # Build templates (12 majors, 12 minors)
-    baseM = np.zeros(12); baseM[0]=baseM[4]=baseM[7]=1.0   # C major: 0,4,7
-    basem = np.zeros(12); basem[0]=basem[3]=basem[7]=1.0   # C minor: 0,3,7
-    maj_templates = np.stack([np.roll(baseM, k) for k in range(12)])  # (12,12)
-    min_templates = np.stack([np.roll(basem, k) for k in range(12)])  # (12,12)
-
-    # Normalize chroma columns
-    Cn = C / (np.linalg.norm(C, axis=0, keepdims=True) + 1e-9)
-
-    # Scores
-    maj_scores = maj_templates @ Cn  # (12,T)
-    min_scores = min_templates @ Cn  # (12,T)
-
-    labels = []
-    for t in range(T):
-        if rms_db[t] < energy_thresh_db:
-            labels.append("N.C.")
-            continue
-        jm = int(np.argmax(maj_scores[:, t]))
-        jn = int(np.argmax(min_scores[:, t]))
-        if maj_scores[jm, t] >= min_scores[jn, t]:
-            labels.append(PC_NAMES[jm])
-        else:
-            labels.append(PC_NAMES[jn] + "m")
-
-    # Framewise → segments
-    segs = []
-    cur = labels[0]; start = float(times[0]) if T else 0.0
-    for i in range(1, T):
-        if labels[i] != cur:
-            end = float(times[i])
-            if cur != "N.C.":
-                segs.append({"start": round(start,3), "end": round(end,3), "chord": cur})
-            cur = labels[i]; start = float(times[i])
-    tail = float(times[-1] + hop_s if T else start + hop_s)
-    if cur != "N.C.":
-        segs.append({"start": round(start,3), "end": round(tail,3), "chord": cur})
-
-    # Reuse your cleanup
-    return _prune_blips(_merge_adjacent(segs))
-
-
-
 # ---- TUNABLES ----
 HOP              = 0.50     # seconds per token for rasterization
 MODE_WIN         = 5        # odd number; token mode filter window
-MIN_CHORD_DUR    = 1.20     # < this = treat as blip (unless slot expects it)
-MIN_NC_DUR       = 0.60     # tiny N.C. gaps are dropped/bridged
-MIN_DIM_DUR      = 2.00     # short dim/aug hits are likely noise
-K_CANDIDATES     = [3,4,5,6,7,8]  # pattern lengths to try
-MIN_OCC          = 2        # pattern must repeat at least this many times
-MIN_SEP_TOK      = 8        # min token separation between two occurrences
-MAX_NC_RATIO     = 0.50     # skip windows that are >50% N.C.
-ALT_THRESH       = 0.35     # allow alternates at slot if they appear ≥35% there
-STRICT_ENFORCE   = True     # when True, coerce anything inside a repeated window to consensus
-KEEP_OUTSIDE     = True     # keep (smoothed) chords outside repeated windows
+MIN_CHORD_DUR    = 1.20
+MIN_NC_DUR       = 0.60
+MIN_DIM_DUR      = 2.00
+K_CANDIDATES     = [3,4,5,6,7,8]
+MIN_OCC          = 2
+MIN_SEP_TOK      = 8
+MAX_NC_RATIO     = 0.50
+ALT_THRESH       = 0.35
+STRICT_ENFORCE   = True
+KEEP_OUTSIDE     = True
 
 # ---- Label simplification ----
-# Normalize labels like "Ebmaj7", "Bb6", "Gdim", "Cm7", "A:7" → triads: "Eb", "Bb", "Gdim", "Cm", "A"
 _TRIAD_RE = re.compile(r'^([A-G][b#]?)(?::([A-Za-z0-9+\-]+))?$')
 
 def simplify_label(raw: str) -> str:
-    """
-    Map a Chordino label to a stable triad-ish symbol.
-    - N -> N.C.
-    - min/min7/min9 -> m
-    - maj/maj7/6/9/add/sus/7 -> major triad (drop color)
-    - dim/°/o/aug/+ stay as 'dim'/'aug' (we'll suppress if too short)
-    """
     lab = raw.strip().strip('"').strip()
     if lab == 'N':
         return 'N.C.'
     m = _TRIAD_RE.match(lab)
     if not m:
-        # bare root like "Eb" or "Cm7" without colon might still be fine:
-        # try manual parse
         if lab.endswith('m'):
-            return lab  # "Cm"
-        return lab  # "Eb", "Bb6" etc; handled below
+            return lab  # e.g., "Cm"
+        return lab
     root = m.group(1)
     qual = (m.group(2) or 'maj').lower()
-
-    # minor family
     if qual.startswith('min') or qual.startswith('m'):
         return root + 'm'
-
-    # diminished / augmented treated explicitly
     if 'dim' in qual or '°' in qual or 'o' in qual:
         return root + 'dim'
     if 'aug' in qual or '+' in qual:
         return root + 'aug'
-
-    # dominant 7 / maj7 / 6 / 9 / add / sus etc → collapse to major triad
     return root
 
 def collapse_colors(name: str) -> str:
-    """
-    Further collapse text labels like 'Bb6','Ebmaj7','G7','Fsus4' → 'Bb','Eb','G','F'
-    Keep 'Xm' minor, and 'Xdim','Xaug' as-is.
-    """
     if name == 'N.C.': return name
     if name.endswith('m'): return name
     if name.endswith('dim') or name.endswith('aug'): return name
-    # drop trailing color strings
-    # common endings: maj7, maj9, 6, 7, 9, 11, 13, sus2, sus4, add9, etc.
     base = re.match(r'^([A-G][b#]?)(?:.*)?$', name)
     return base.group(1) if base else name
 
-# ---- Parse LAB with 2-col *or* 3-col support, then simplify ----
+# ---- Parse LAB (2-col or 3-col), then simplify ----
 _LAB3 = re.compile(r'^\s*([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)\s*$')
 _LAB2 = re.compile(r'^\s*([0-9]+(?:\.[0-9]+)?)\s+(.+?)\s*$')
 
 def parse_lab(lab_text: str):
-    # Try 3-col first (start end label)
     segs = []
     for line in (lab_text or "").splitlines():
         m = _LAB3.match(line)
@@ -312,7 +208,6 @@ def parse_lab(lab_text: str):
     if segs:
         return segs
 
-    # Fallback to 2-col events (time label) -> stitch into segments
     events = []
     for line in (lab_text or "").splitlines():
         m = _LAB2.match(line)
@@ -331,7 +226,6 @@ def parse_lab(lab_text: str):
         out.append({"start": round(t0,3), "end": round(t1,3), "chord": lab0})
     return out
 
-_TRIAD_RE = re.compile(r'^([A-G][b#]?)(?::([A-Za-z0-9+\-]+))?$')
 def _simplify(raw: str) -> str:
     lab = raw.strip().strip('"').strip()
     if lab == 'N': return 'N.C.'
@@ -343,7 +237,6 @@ def _simplify(raw: str) -> str:
         if 'dim' in qual or '°' in qual or 'o' in qual:   return root + 'dim'
         if 'aug' in qual or '+' in qual:                   return root + 'aug'
         return root
-    # fallback (e.g., "Bb6", "Cm7")
     if lab.endswith('m'): return lab
     m = re.match(r'^([A-G][b#]?)', lab)
     return m.group(1) if m else lab
@@ -363,7 +256,6 @@ def _simplify_segments(segs):
     for s in segs:
         out.append({"start": s["start"], "end": s["end"], "chord": _simplify(s["chord"])})
     return _merge_adjacent(out)
-
 
 def _prune_blips(segs):
     if not segs: return []
@@ -393,7 +285,7 @@ def _prune_blips(segs):
             nxt  = S[idx+1] if idx+1 < len(S) else None
             if prev and nxt and prev["chord"] == nxt["chord"]:
                 s["chord"] = prev["chord"]
-            elif prev and (not nxt or (prev["end"]-prev["start"]) >= (nxt["end"]-nxt["start"])):
+            elif prev and (not nxt or (prev["end"]-prev["start"]) >= (nxt["end"]-nxt["start"])):  # noqa
                 s["chord"] = prev["chord"]
             elif nxt:
                 s["chord"] = nxt["chord"]
@@ -424,7 +316,6 @@ def _mode_filter(tokens, win=MODE_WIN):
         a = max(0, i-half); b = min(len(tokens), i+half+1)
         sub = tokens[a:b]
         counts = Counter(sub)
-        # prefer non-N.C. in ties
         best = sorted(counts.items(), key=lambda kv: (kv[1], kv[0]!="N.C."), reverse=True)[0][0]
         out[i] = best
     return out
@@ -439,13 +330,10 @@ def _derasterize(tokens, times):
             cur = tokens[i]; start = float(times[i])
     tail = float(times[-1] + (times[1]-times[0]) if len(times)>1 else start+HOP)
     segs.append({"start": round(start,3), "end": round(tail,3), "chord": cur})
-    # drop tiny N.C.
     segs = [s for s in segs if s["chord"]!="N.C." or (s["end"]-s["start"]) >= MIN_NC_DUR]
     return _merge_adjacent(segs)
 
-
 # ---- Repeated-section detection ----
-# ----- find best repeating window (variable k) -----
 def _nonoverlapping_starts(all_starts, min_sep):
     sel = []; last = -10**9
     for s in sorted(all_starts):
@@ -454,13 +342,11 @@ def _nonoverlapping_starts(all_starts, min_sep):
     return sel
 
 def _score_window(window, starts):
-    # coverage * repetition, penalize N.C.-heavy windows
     nc_ratio = window.count("N.C.")/len(window)
     unique = len({x for x in window if x!="N.C."})
     return (len(starts) * len(window) * max(0.0, 1.0 - nc_ratio)) + unique
 
 def find_best_pattern(tokens, k_list=K_CANDIDATES, min_occ=MIN_OCC, min_sep=MIN_SEP_TOK):
-    """Return (pattern_tokens, starts) or (None, [])."""
     best = (None, [])
     best_score = -1
     for k in k_list:
@@ -468,9 +354,9 @@ def find_best_pattern(tokens, k_list=K_CANDIDATES, min_occ=MIN_OCC, min_sep=MIN_
         table = defaultdict(list)
         for i in range(len(tokens)-k+1):
             win = tuple(tokens[i:i+k])
-            if win.count("N.C.")/k > MAX_NC_RATIO:  # too many no-chords → skip
+            if win.count("N.C.")/k > MAX_NC_RATIO:  # skip
                 continue
-            if len({x for x in win if x!="N.C."}) < 2:  # need at least 2 distinct chords
+            if len({x for x in win if x!="N.C."}) < 2:
                 continue
             table[win].append(i)
         for win, idxs in table.items():
@@ -484,7 +370,6 @@ def find_best_pattern(tokens, k_list=K_CANDIDATES, min_occ=MIN_OCC, min_sep=MIN_
     return best
 
 def consensus_for_pattern(tokens, starts, k):
-    """Per-slot consensus & alternates across all occurrences."""
     cons = []; alts = []
     for off in range(k):
         votes = [tokens[s+off] for s in starts if s+off < len(tokens)]
@@ -493,20 +378,17 @@ def consensus_for_pattern(tokens, starts, k):
             c = Counter(votes)
             top = c.most_common(1)[0][0]
             cons.append(top)
-            # alternates above threshold
             allowed = {lab for lab, n in c.items() if n/sum(c.values()) >= ALT_THRESH}
             alts.append(allowed)
         else:
             cons.append("N.C."); alts.append(set())
-    return cons, alts  # lists of length k
+    return cons, alts
 
 def enforce_pattern_variable(tokens, times, pattern, starts, strict=STRICT_ENFORCE):
-    """Coerce tokens inside the repeated windows to the consensus pattern (with allowed alternates)."""
     k = len(pattern)
     cons, alts = consensus_for_pattern(tokens, starts, k)
     toks = tokens[:]
     covered = np.zeros(len(tokens), dtype=bool)
-
     for s in starts:
         for off in range(k):
             i = s+off
@@ -518,47 +400,27 @@ def enforce_pattern_variable(tokens, times, pattern, starts, strict=STRICT_ENFOR
                 continue
             if strict or toks[i]=="N.C.":
                 toks[i] = want
-
-    # light smoothing inside covered regions
     toks = _mode_filter(toks, win=MODE_WIN)
-
-    # outside regions: keep (optionally mode-filter)
-    if KEEP_OUTSIDE:
-        return _derasterize(toks, times), covered
-    else:
-        # zero out outside (optional path)
-        for i, c in enumerate(covered):
-            if not c: toks[i] = "N.C."
-        return _derasterize(toks, times), covered
+    return _derasterize(toks, times), covered
 
 def postprocess_variable_pattern(raw_segments):
-    """
-    Full pipeline for variable-length patterns.
-    Returns final_segments, pattern_tokens, section_ranges
-    """
     simp = _simplify_segments(raw_segments)
     base = _prune_blips(simp)
     tokens, times = _rasterize(base)
     if not tokens:
         return base, [], []
-
     tokens = _mode_filter(tokens, win=MODE_WIN)
-
     pattern, starts = find_best_pattern(tokens)
     if not pattern:
-        # no solid repeats found → just derasterize the smoothed tokens
         rough = _derasterize(tokens, times)
         return _prune_blips(rough), [], []
-
-    enforced, covered_mask = enforce_pattern_variable(tokens, times, pattern, starts, strict=STRICT_ENFORCE)
+    enforced, _covered_mask = enforce_pattern_variable(tokens, times, pattern, starts, strict=STRICT_ENFORCE)
     final = _prune_blips(enforced)
 
-    # section time ranges for UI (merge overlapping windows)
     secs = []
     for s in starts:
         t0 = float(times[s]); t1 = float(times[min(s+len(pattern), len(times)-1)])
         secs.append({"start": round(t0,3), "end": round(t1,3)})
-    # merge overlapping/adjacent sections
     secs.sort(key=lambda x: x["start"])
     merged = []
     for sec in secs:
@@ -566,39 +428,23 @@ def postprocess_variable_pattern(raw_segments):
             merged.append(sec)
         else:
             merged[-1]["end"] = max(merged[-1]["end"], sec["end"])
-
     return final, pattern, merged
 
-
 # ===== Lyrics parsing & chord-over-lyrics alignment =====
-import re
-
-# [mm:ss.xx] or [m:ss.x] style tags
 _LRC_TIME = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d{1,2}))?\]")
 
 def parse_lrc(lrc_text: str):
-    """
-    Parse LRC (or plain text) into a list of lines:
-      [{"start": float|None, "end": float|None, "text": str}, ...]
-    - Accepts multiple timestamps on one line (uses the earliest as the start).
-    - Leaves "end" = None; caller typically fills end from the next line or song end.
-    - If a line has no timestamps, we keep start=None and end=None (handled later).
-    """
     out = []
     for raw in (lrc_text or "").splitlines():
         line = raw.rstrip("\n")
         if not line.strip():
             continue
         times = list(_LRC_TIME.finditer(line))
-        # remove all [..] tags from the visible text
         text = _LRC_TIME.sub("", line).strip()
         if not times:
-            # plain line (no timing)
             if text:
                 out.append({"start": None, "end": None, "text": text})
             continue
-
-        # convert all tags on the line, keep earliest as start
         starts = []
         for m in times:
             mm = int(m.group(1))
@@ -607,25 +453,17 @@ def parse_lrc(lrc_text: str):
             if frac is None:
                 t = mm*60 + ss
             else:
-                # .x or .xx
                 scale = 10 if len(frac) == 1 else 100
                 t = mm*60 + ss + int(frac)/scale
             starts.append(float(t))
         if text:
             out.append({"start": min(starts), "end": None, "text": text})
-
-    # Fill end times from the next line's start when both are known
     for i in range(len(out)-1):
         if out[i]["start"] is not None and out[i+1]["start"] is not None:
             out[i]["end"] = out[i+1]["start"]
     return out
 
 def interpolate_words(line):
-    """
-    Given a line dict {"start","end","text"}, return a list of (word, time_or_None).
-    If start/end missing or invalid, we return (word, None).
-    Otherwise, we spread words uniformly in [start, end).
-    """
     words = line["text"].split()
     if not words:
         return []
@@ -639,26 +477,11 @@ def interpolate_words(line):
     return [(w, float(t0) + i*step) for i, w in enumerate(words)]
 
 def align_chords_to_words(segments, lrc_lines):
-    """
-    Place chord names above the first character of the word whose time falls inside that chord span.
-
-    segments: [{start: float, end: float, chord: str}, ...]
-    lrc_lines: result of parse_lrc()
-
-    Returns a list of per-line dicts:
-      {
-        "lyrics": "<the line text>",
-        "placed": [(column_index, "ChordName"), ...],
-        "mono":   "<chord row>\\n<lyrics row>"  # for <pre> monospace rendering
-      }
-    """
-    # Safety: sort segments
     segs = sorted(segments, key=lambda s: (s["start"], s["end"]))
 
     def chord_at(t):
         if t is None:
             return None
-        # Linear scan is fine for small N; swap for bisect if needed
         for s in segs:
             if s["start"] <= t < s["end"]:
                 return s["chord"]
@@ -672,19 +495,16 @@ def align_chords_to_words(segments, lrc_lines):
             aligned.append({"lyrics": "", "placed": [], "mono": ""})
             continue
 
-        placed = []  # (column_index, chord)
+        placed = []
         col = 0
         last = None
         for idx, (w, t) in enumerate(words_with_t):
             ch = chord_at(t)
-            # Only place when chord changes and is not N.C.
             if ch and ch != "N.C." and ch != last:
                 placed.append((col, ch))
             last = ch
-            # advance position: word + one space (except after last word)
             col += len(w) + (1 if idx < len(words_with_t)-1 else 0)
 
-        # Build chord row in monospace to align above lyrics_text
         chord_row = [" "] * len(lyrics_text)
         for pos, ch in placed:
             for i, c in enumerate(ch):
@@ -701,175 +521,10 @@ def align_chords_to_words(segments, lrc_lines):
     return aligned
 
 
-# === EDIT THESE PATHS ===
-SONIC = os.environ.get("SONIC", r"C:\...windows\path\sonic-annotator.exe")
-VAMP_PATH = os.environ.get("VAMP_PATH", r"...")
-DISABLE_SONIC = os.environ.get("DISABLE_SONIC", "0") == "1"
-
-
-# (You can also use: r"C:\Program Files\Vamp Plugins" if that’s where the DLL is)
-# ========================
-
 VERSION = "SquareOne v1"
-
 app = FastAPI(title=f"Chord Detector ({VERSION})")
 
-# add near your imports
-from google.cloud import storage
-from google.oauth2 import service_account
-import datetime, json
-
-GCS_BUCKET = os.environ.get("GCS_BUCKET")  # set in Cloud Run
-SIGN_URL_EXPIRE_MIN = 15
-
-def _storage_client():
-    # uses default creds in Cloud Run
-    return storage.Client()
-
-@app.post("/upload-url")
-def get_upload_url():
-    """
-    Returns a resumable signed URL for uploading a WAV directly to GCS.
-    Client does a PUT to this URL (or uses x-goog-resumable).
-    """
-    fn = f"uploads/{datetime.datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{os.urandom(4).hex()}.wav"
-    bucket = _storage_client().bucket(GCS_BUCKET)
-    blob = bucket.blob(fn)
-
-    url = blob.generate_signed_url(
-        version="v4",
-        expiration=datetime.timedelta(minutes=SIGN_URL_EXPIRE_MIN),
-        method="PUT",
-        content_type="audio/wav",
-        headers={"x-goog-resumable": "start"},
-    )
-    return {"ok": True, "bucket": GCS_BUCKET, "object": fn, "upload_url": url}
-
-
-import tempfile
-
-def _download_gcs_to_temp(bucket_name: str, object_name: str) -> str:
-    client = _storage_client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(object_name)
-    fd, path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
-    blob.download_to_filename(path)
-    return path
-
-from fastapi import Body
-
-@app.post("/analyze_gcs")
-def analyze_gcs(
-    ref: dict = Body(...),  # { "bucket": "...", "object": "...", "lyrics_lrc": "...", "lyrics_auto": "true/false" }
-):
-    wav = None
-    try:
-        bucket = ref.get("bucket") or GCS_BUCKET
-        obj = ref["object"]
-        lyrics_lrc = (ref.get("lyrics_lrc") or "").strip()
-        lyrics_auto = str(ref.get("lyrics_auto") or "").lower() == "true"
-
-        wav = _download_gcs_to_temp(bucket, obj)
-
-        # ---- chord detection (do NOT fail if Sonic missing) ----
-        segments_error = None
-        final, pattern, sections = [], [], []
-        try:
-            lab = run_sonic_simplechord(wav)  # works if Sonic in Docker image
-            raw_segments = parse_lab(lab)
-            final, pattern, sections = postprocess_variable_pattern(raw_segments)
-        except Exception as e:
-            segments_error = f"Chord detection unavailable: {type(e).__name__}: {e}"
-
-        # ---- key detection ----
-        det_key = None
-        if final:
-            try:
-                tonic_pc, mode = estimate_key_krumhansl(wav)
-                if tonic_pc is not None:
-                    det_key = f"{PC_NAMES[tonic_pc]} {'major' if mode == 'maj' else 'minor'}"
-                    final = key_aware_correct(final, tonic_pc, mode,
-                                              drop_out_of_scale_if_short=True, short_thresh=1.2)
-            except Exception:
-                pass
-
-        # ---- lyrics (ASR only if requested and empty) ----
-        lrc_text = lyrics_lrc
-        asr_error = None
-        if not lrc_text and lyrics_auto:
-            try:
-                lrc_text = whisper_to_lrc(wav, per_word=False)
-            except Exception as e:
-                asr_error = f"Auto-lyrics failed: {type(e).__name__}: {e}"
-                lrc_text = ""
-
-        aligned = []
-        if lrc_text:
-            lines = parse_lrc(lrc_text)
-            if not any(ln.get("start") is not None for ln in lines):
-                total = float(final[-1]["end"]) if final else 0.0
-                if total <= 0 and librosa is not None:
-                    try:
-                        y, sr = librosa.load(wav, sr=None, mono=True)
-                        total = len(y) / float(sr)
-                    except Exception:
-                        total = 0.0
-                n = max(1, len(lines))
-                step = (total or n) / n
-                for i, ln in enumerate(lines):
-                    ln["start"] = i*step
-                    ln["end"] = (i+1)*step if i < n-1 else total
-
-            song_end = float(final[-1]["end"]) if final else (lines[-1]["end"] if lines and lines[-1].get("end") else None)
-            for i, ln in enumerate(lines):
-                if ln.get("start") is not None and ln.get("end") is None:
-                    ln["end"] = lines[i+1]["start"] if i+1 < len(lines) and lines[i+1].get("start") is not None else song_end
-
-            aligned = align_chords_to_words(final, lines)
-
-        return JSONResponse({
-            "ok": True,
-            "gcs_object": obj,
-            "detected_key": det_key,
-            "detected_pattern": pattern,
-            "sections": sections,
-            "segments": final,
-            "segments_error": segments_error,
-            "lyrics_lrc": lrc_text or None,
-            "aligned": aligned,
-            "asr_error": asr_error,
-        })
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
-    finally:
-        try:
-            if wav and os.path.exists(wav):
-                os.remove(wav)
-        except Exception:
-            pass
-
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://tabslated.web.app",   # Firebase site
-        "http://localhost:8000",       # local dev (if any)
-        "http://localhost:5173"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ----- Core helpers -----
-import tempfile
-
-# 1) Run SA -> Chordino, capture LAB on stdout (no -o)
 def run_sonic_simplechord(wav_path: str) -> str:
-    if DISABLE_SONIC:
-        raise RuntimeError("Chord detection temporarily disabled (DISABLE_SONIC=1).")
     if not os.path.isfile(SONIC):
         raise RuntimeError(f"Sonic Annotator not found at: {SONIC}")
     env = os.environ.copy()
@@ -885,69 +540,7 @@ def run_sonic_simplechord(wav_path: str) -> str:
         raise RuntimeError("Sonic Annotator failed:\n" + (p.stderr or p.stdout or ""))
     return p.stdout
 
-
-# 2) Robust LAB parser that ignores any non-LAB lines
-import re
-
-# 3-col: start end label
-_LAB3 = re.compile(r'^\s*([0-9]+(?:\.[0-9]+)?)\s+([0-9]+(?:\.[0-9]+)?)\s+(.+?)\s*$')
-# 2-col: time label  (what your smoketest shows)
-_LAB2 = re.compile(r'^\s*([0-9]+(?:\.[0-9]+)?)\s+(.+?)\s*$')
-
-def _norm_label(raw: str) -> str:
-    lab = raw.strip().strip('"').strip()
-    if lab == 'N':
-        return 'N.C.'
-    # Examples: C:maj, A:min, G:7, F
-    parts = lab.split(':', 1)
-    root = parts[0]
-    qual  = parts[1] if len(parts) > 1 else 'maj'
-    return root + ('m' if qual.startswith('min') else '')
-
-def parse_lab(lab_text: str):
-    """
-    Parse Sonic Annotator LAB for Chordino:
-    - If lines are 'start end label' -> return segments directly.
-    - If lines are 'time label'      -> convert consecutive events to segments.
-    Returns list of dicts: [{start, end, chord}, ...]
-    """
-    lines = (lab_text or "").splitlines()
-
-    # Try 3-column first
-    segs_3 = []
-    for line in lines:
-        m = _LAB3.match(line)
-        if m:
-            s = float(m.group(1)); e = float(m.group(2)); raw = m.group(3).split()[0]
-            segs_3.append({"start": round(s,3), "end": round(e,3), "chord": _norm_label(raw)})
-    if segs_3:
-        return segs_3
-
-    # Fallback: 2-column events  -> stitch into segments by taking [t[i], t[i+1]) with label[i]
-    events = []
-    for line in lines:
-        m = _LAB2.match(line)
-        if not m:
-            continue  # skip any log noise
-        t = float(m.group(1)); raw = m.group(2).split()[0]
-        events.append((t, _norm_label(raw)))
-
-    if len(events) < 2:
-        return []  # not enough info to form a segment
-
-    segs = []
-    for i in range(len(events)-1):
-        t0, lab0 = events[i]
-        t1, _    = events[i+1]
-        # skip leading/trailing/adjacent N.C. boundaries
-        if lab0 == 'N.C.':
-            continue
-        segs.append({"start": round(t0,3), "end": round(t1,3), "chord": lab0})
-    return segs
-
-
 def merge_segments(segs, min_dur=0.6):
-    """Merge consecutive identical chords; turn very short non-N.C. blips into N.C."""
     if not segs:
         return segs
     merged = []
@@ -966,21 +559,15 @@ def merge_segments(segs, min_dur=0.6):
     return merged
 
 def is_wav_bytes(raw: bytes) -> bool:
-    # RIFF....WAVE
     return len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"
 
 def write_wav_from_bytes(raw: bytes) -> str:
-    """Save uploaded bytes as a .wav file. We require WAV to keep things simple & robust."""
     if not is_wav_bytes(raw):
         raise RuntimeError("Please upload a WAV file (PCM/float). You can convert in any editor (e.g., Audacity).")
     fd, path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
     with open(path, "wb") as f:
         f.write(raw)
     return path
-
-# ----- Self-test: synthesize a C major chord -----
-# remove: import soundfile as sf
-from scipy.io.wavfile import write as wavwrite
 
 def synth_c_major_wav(seconds=3.0, sr=44100) -> str:
     t = np.linspace(0, seconds, int(sr*seconds), endpoint=False, dtype=np.float32)
@@ -991,7 +578,7 @@ def synth_c_major_wav(seconds=3.0, sr=44100) -> str:
     y[:Nf] *= fade; y[-Nf:] *= fade[::-1]
     y /= max(1e-9, np.abs(y).max())
     fd, path = tempfile.mkstemp(suffix=".wav"); os.close(fd)
-    wavwrite(path, sr, (y * 32767).astype(np.int16))  # 16-bit PCM
+    sf.write(path, y, sr)
     return path
 
 # ----- Routes -----
@@ -1027,13 +614,10 @@ def home():
   </div>
 
 <script>
-/* ==== IMPORTANT: Point to your Cloud Run API ==== */
-const API = "https://YOUR-CLOUD-RUN-URL";  // e.g. "https://tabslated-836301510193.us-central1.run.app"
-
-const f   = document.getElementById('f');
+const f = document.getElementById('f');
 const tab = document.getElementById('tab');
 const lrc = document.getElementById('lrc');
-const auto= document.getElementById('auto');
+const auto = document.getElementById('auto');
 const smk = document.getElementById('smk');
 
 f.addEventListener('submit', async (e)=>{
@@ -1044,18 +628,20 @@ f.addEventListener('submit', async (e)=>{
   fd.append('lyrics_auto', auto.checked ? 'true' : 'false');
 
   try {
-    const r = await fetch(`${API}/analyze`, { method:'POST', body: fd });
+    const r = await fetch('/analyze', { method:'POST', body: fd });
     if (!r.ok) {
-      tab.textContent = `Error running /analyze\\nHTTP ${r.status} ${r.statusText}\\n${await r.text()}`;
+      tab.textContent = 'Error running /analyze';
       return;
     }
     const j = await r.json();
-    tab.textContent = '';
-    if (j.segments_error) tab.textContent += `Note: ${j.segments_error}\\n\\n`;
-    if (j.asr_error)      tab.textContent += `Note: ${j.asr_error}\\n\\n`;
-    if (j.aligned?.length) tab.textContent += j.aligned.map(x => x.mono).join("\\n\\n");
-    else if (j.lyrics_lrc) tab.textContent += "LRC:\\n\\n" + j.lyrics_lrc;
-    else tab.textContent += "No lyrics provided/available.";
+
+    if (j.aligned && j.aligned.length) {
+      tab.textContent = j.aligned.map(x => x.mono).join("\\n\\n");
+    } else if (j.lyrics_lrc) {
+      tab.textContent = "No per-line alignment built, but LRC was returned:\\n\\n" + j.lyrics_lrc;
+    } else {
+      tab.textContent = "No lyrics provided/available. Paste LRC or enable auto-generate.";
+    }
   } catch (err) {
     tab.textContent = 'Network/JS error calling /analyze';
   }
@@ -1064,16 +650,14 @@ f.addEventListener('submit', async (e)=>{
 smk.addEventListener('click', async ()=>{
   tab.textContent='Running smoketest…';
   try {
-    const r = await fetch(`${API}/_smoketest`);
+    const r = await fetch('/_smoketest');
     if (!r.ok) {
-      tab.textContent = `Smoketest error (HTTP ${r.status}).`;
+      tab.textContent = 'Smoketest error.';
       return;
     }
     const j = await r.json();
     if (j.segments && j.segments.length) {
       tab.textContent = j.segments.map(s => `${s.start.toFixed(2)}–${s.end.toFixed(2)}\\t${s.chord}`).join("\\n");
-    } else if (j.note) {
-      tab.textContent = j.note;
     } else {
       tab.textContent = 'Smoketest returned no segments.';
     }
@@ -1086,56 +670,50 @@ smk.addEventListener('click', async ()=>{
 """
     return HTMLResponse(html)
 
+
 @app.get("/__whoami")
 def whoami():
-    return {
-        "version": VERSION,
-        "sonic": SONIC,
-        "vamp_path": VAMP_PATH,
-        "disable_sonic": DISABLE_SONIC,
-        "platform": os.name,
-        "cwd": str(pathlib.Path().resolve()),
-    }
+    return {"version": VERSION, "sonic": SONIC, "vamp_path": VAMP_PATH, "cwd": str(pathlib.Path().resolve())}
 
 @app.get("/health")
 def health():
-    env = os.environ.copy()
-    env["VAMP_PATH"] = VAMP_PATH
+    env = os.environ.copy(); env["VAMP_PATH"] = VAMP_PATH
     try:
-        out = subprocess.check_output(
-            [SONIC, "-l"],
-            env=env,
-            stderr=subprocess.STDOUT,
-            text=True,
-            errors="ignore"
-        )
+        out = subprocess.check_output([SONIC, "-l"], env=env, stderr=subprocess.STDOUT, text=True, errors="ignore")
         has_chordino = any("chordino" in ln.lower() for ln in out.splitlines())
-        return {"ok": True, "has_chordino": bool(has_chordino), "listing": out}
-    except subprocess.CalledProcessError as e:
-        # Return the combined stdout/stderr so we can see *why*
-        return {"ok": False, "error": str(e), "output": e.output}
+        return {"ok": True, "has_chordino": bool(has_chordino), "note": "look for 'chordino' in plugins list"}
     except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
+        return {"ok": False, "error": str(e)}
 
 @app.get("/_smoketest")
 def smoketest():
     wav = synth_c_major_wav()
     try:
-        try:
-            lab = run_sonic_simplechord(wav)
-            segs = merge_segments(parse_lab(lab), min_dur=0.4)
-            labels = sorted(set(s["chord"] for s in segs))
-            return {"ok": True, "labels": labels, "segments": segs, "raw_first_lines": lab.splitlines()[:8]}
-        except Exception as chord_err:
-            return {"ok": True, "note": f"Chord detector unavailable: {chord_err}", "segments": []}
+        lab = run_sonic_simplechord(wav)
+        segs = merge_segments(parse_lab(lab), min_dur=0.4)
+        labels = sorted(set([s["chord"] for s in segs]))
+        return {"ok": True, "labels": labels, "segments": segs, "raw_first_lines": lab.splitlines()[:8]}
+    except Exception as e:
+        print(e)
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
     finally:
-        try: os.remove(wav)
-        except: pass
+        try:
+            os.remove(wav)
+        except Exception:
+            pass
+
+# --- helper: safe duration for spreading lyrics when no chords ---
+def safe_audio_duration(path: str) -> float | None:
+    try:
+        info = sf.info(path)
+        if info.samplerate and info.frames:
+            return float(info.frames) / float(info.samplerate)
+    except Exception:
+        pass
+    return None
 
 
 from fastapi import Form
-from fastapi.responses import JSONResponse
 
 @app.post("/analyze")
 async def analyze(
@@ -1145,72 +723,54 @@ async def analyze(
 ):
     wav = None
     try:
-        # 1) Save upload (requires python-multipart in requirements.txt)
+        # ---- Read upload (requires python-multipart installed) ----
         raw = await file.read()
-        wav = write_wav_from_bytes(raw)  # still enforces WAV for now
+        wav = write_wav_from_bytes(raw)  # raises if not a real WAV
 
-        # 2) Chord detection — NEVER fail the request if Sonic is off/missing
+        # ---- Try chord detection, but don't fail the whole request if it breaks ----
         segments_error = None
         final, pattern, sections = [], [], []
         try:
-            lab = run_sonic_simplechord(wav)  # may raise when DISABLE_SONIC=1 or binary missing
-            if lab and lab.strip():
-                raw_segments = parse_lab(lab)
-                if raw_segments:
-                    final, pattern, sections = postprocess_variable_pattern(raw_segments)
+            lab = run_sonic_simplechord(wav)  # this might raise
+            raw_segments = parse_lab(lab)
+            final, pattern, sections = postprocess_variable_pattern(raw_segments)
         except Exception as e:
-            # Try librosa fallback instead of failing
-            try:
-                final = fallback_chords_librosa(wav, hop_s = HOP)
-                if final:
-                    try:
-                        tonic_pc, mode = estimate_key_krumhansl(wav)
-                        if tonic_pc is not None:
-                            final = key_aware_correct(
-                                final, tonic_pc, mode,
-                                drop_out_of_scale_if_short = True, short_thresh = 1.2
-                            )
-                    except Exception:
-                        pass
-            except Exception as e2:
-                segments_error = f"Chord detection unavailable: {type(e).__name__}: {e} | Fallback failed: {type(e2).__name__}: {e2}"
-            else:
-                segments_error = "Chordino disabled/missing; used librosa fallback triads."
-            # final/pattern/sections stay empty; continue
+            segments_error = f"Chord detection unavailable: {type(e).__name__}: {e}"
 
-        # 3) Key detection + diatonic snap (only if we actually have segments)
+        # ---- Key detection (optional; only if we have chords) ----
         det_key = None
         if final:
             try:
                 tonic_pc, mode = estimate_key_krumhansl(wav)
                 if tonic_pc is not None:
-                    det_key = f"{PC_NAMES[tonic_pc]} {'major' if mode == 'maj' else 'minor'}"
+                    det_key = f"{PC_NAMES[tonic_pc]} {'major' if mode=='maj' else 'minor'}"
                     final = key_aware_correct(
                         final, tonic_pc, mode,
                         drop_out_of_scale_if_short=True, short_thresh=1.2
                     )
             except Exception:
-                pass  # key detection is best-effort
+                pass  # ignore key errors
 
-        # 4) Lyrics: provided vs auto (Whisper)
+        # ---- Lyrics: prefer user-provided; optionally auto with Whisper ----
         lrc_text = (lyrics_lrc or "").strip()
         asr_error = None
         if not lrc_text and (lyrics_auto or "").lower() == "true":
             try:
-                lrc_text = whisper_to_lrc(wav, per_word=False)  # segment-level lines are cleaner for singing
-            except Exception as asr_err:
-                asr_error = f"Auto-lyrics failed: {type(asr_err).__name__}: {asr_err}"
-                lrc_text = ""
+                # If your Whisper init is eager, consider lazy init to avoid long import stalls.
+                lrc_text = whisper_to_lrc(wav, per_word=False)
+            except Exception as e:
+                asr_error = f"Auto-lyrics failed: {type(e).__name__}: {e}"
+                lrc_text = ""  # continue without lyrics
 
-        # 5) Align chords → words (works even if `final` is empty; you’ll still see lyrics)
+        # ---- Align chords over lyrics (works even if final==[]) ----
         aligned = []
         if lrc_text:
             lines = parse_lrc(lrc_text)
 
-            # If no timestamps at all, spread lines across song duration (or roughly equal spacing)
+            # If there are no timestamps at all, spread lines across duration
             if not any(ln.get("start") is not None for ln in lines):
-                # try to get duration
                 total = float(final[-1]["end"]) if final else 0.0
+                # fallback to librosa duration estimate if no chord segments
                 if total <= 0 and librosa is not None:
                     try:
                         y, sr = librosa.load(wav, sr=None, mono=True)
@@ -1221,34 +781,31 @@ async def analyze(
                 step = (total or n) / n
                 for i, ln in enumerate(lines):
                     ln["start"] = i * step
-                    ln["end"] = (i + 1) * step if i < n - 1 else total
+                    ln["end"] = (i+1) * step if i < n-1 else total
 
-            # Fill missing ends from next line or song end
-            song_end = float(final[-1]["end"]) if final else (
-                lines[-1]["end"] if lines and lines[-1].get("end") is not None else None
-            )
+            # fill missing ends from next start or song end
+            song_end = float(final[-1]["end"]) if final else (lines[-1]["end"] if lines and lines[-1].get("end") else None)
             for i, ln in enumerate(lines):
                 if ln.get("start") is not None and ln.get("end") is None:
-                    ln["end"] = lines[i + 1]["start"] if (i + 1 < len(lines) and lines[i + 1].get("start") is not None) else song_end
+                    ln["end"] = lines[i+1]["start"] if i+1 < len(lines) and lines[i+1].get("start") is not None else song_end
 
             aligned = align_chords_to_words(final, lines)
 
-        # 6) Success response (HTTP 200 even if Sonic is disabled)
         return JSONResponse({
             "ok": True,
             "filename": file.filename,
             "detected_key": det_key,
             "detected_pattern": pattern,
             "sections": sections,
-            "segments": final,            # [] when Sonic disabled or missing
-            "segments_error": segments_error,  # human-readable note
+            "segments": final,            # may be []
+            "segments_error": segments_error,  # string or None
             "lyrics_lrc": lrc_text or None,
-            "aligned": aligned,           # each has .mono = "CHORDS\nLYRICS"
-            "asr_error": asr_error,       # Whisper problems, if any
+            "aligned": aligned,           # list with .mono for display
+            "asr_error": asr_error,       # string or None
         })
 
     except Exception as e:
-        # Only truly bad requests (e.g., not a WAV) land here
+        # Only true bad requests (e.g., not WAV) end up here
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         try:
@@ -1259,5 +816,6 @@ async def analyze(
 
 
 if __name__ == "__main__":
-    import uvicorn, os
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    import uvicorn
+    print("[startup] running:", pathlib.Path(__file__).resolve())
+    uvicorn.run(app, host="127.0.0.1", port=8010, reload=False)
